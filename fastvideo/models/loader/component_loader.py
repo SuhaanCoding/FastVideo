@@ -7,6 +7,7 @@ import os
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Generator, Iterable
+from contextlib import nullcontext
 from copy import deepcopy
 from typing import cast
 
@@ -18,6 +19,10 @@ from torch.distributed import init_device_mesh
 from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
+from fastvideo.attention.selector import (
+    active_attention_backend_scope,
+    attention_backend_scope,
+)
 from fastvideo.configs.models import EncoderConfig
 from fastvideo.distributed import get_local_torch_device
 from fastvideo.fastvideo_args import FastVideoArgs
@@ -1017,16 +1022,14 @@ class TransformerLoader(ComponentLoader):
         # Generator-only QAT for DMD distillation: the teacher (real_score) and
         # critic (fake_score) transformers load with this flag set and must stay
         # full precision. Drop the nvfp4_qat quant from their copied config, and
-        # mask the global ATTN_QAT_TRAIN env so their attention falls back to dense
-        # (the backend is read globally at build time). The generator loads without
-        # the flag and keeps both.
+        # build their attention under a scope that ignores any process-wide
+        # ATTN_QAT_TRAIN request so it falls back to dense. The generator loads
+        # without the flag and keeps both. The scope is exception-safe and
+        # needs no env mutation or selector cache flush (the request is part
+        # of the resolution cache key).
         _qat_generator_only = hasattr(fastvideo_args, "_loading_teacher_critic_model")
-        _qat_prev_attn_env = None
         if _qat_generator_only:
             dit_config.quant_config = None
-            from fastvideo.attention.selector import _cached_get_attn_backend
-            _qat_prev_attn_env = os.environ.pop("FASTVIDEO_ATTENTION_BACKEND", None)
-            _cached_get_attn_backend.cache_clear()
 
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
@@ -1093,32 +1096,29 @@ class TransformerLoader(ComponentLoader):
             or cls_name == "Cosmos25Transformer3DModel"
             or getattr(fastvideo_args.pipeline_config, "prefix", "") == "Cosmos25"
         )
-        model = maybe_load_fsdp_model(
-            model_cls=model_cls,
-            init_params={"config": dit_config, "hf_config": hf_config},
-            weight_dir_list=safetensors_list,
-            device=get_local_torch_device(),
-            hsdp_replicate_dim=fastvideo_args.hsdp_replicate_dim,
-            hsdp_shard_dim=fastvideo_args.hsdp_shard_dim,
-            strict=strict_load,
-            cpu_offload=fastvideo_args.dit_cpu_offload,
-            pin_cpu_memory=fastvideo_args.pin_cpu_memory,
-            fsdp_inference=fastvideo_args.use_fsdp_inference,
-            # TODO(will): make these configurable
-            default_dtype=default_dtype,
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
-            output_dtype=None,
-            training_mode=fastvideo_args.training_mode,
-            enable_torch_compile=fastvideo_args.enable_torch_compile,
-            torch_compile_kwargs=fastvideo_args.torch_compile_kwargs,
-        )
-
-        if _qat_generator_only:
-            from fastvideo.attention.selector import _cached_get_attn_backend
-            if _qat_prev_attn_env is not None:
-                os.environ["FASTVIDEO_ATTENTION_BACKEND"] = _qat_prev_attn_env
-            _cached_get_attn_backend.cache_clear()
+        attention_context = (attention_backend_scope(None, component="transformer")
+                             if _qat_generator_only else nullcontext())
+        with attention_context:
+            model = maybe_load_fsdp_model(
+                model_cls=model_cls,
+                init_params={"config": dit_config, "hf_config": hf_config},
+                weight_dir_list=safetensors_list,
+                device=get_local_torch_device(),
+                hsdp_replicate_dim=fastvideo_args.hsdp_replicate_dim,
+                hsdp_shard_dim=fastvideo_args.hsdp_shard_dim,
+                strict=strict_load,
+                cpu_offload=fastvideo_args.dit_cpu_offload,
+                pin_cpu_memory=fastvideo_args.pin_cpu_memory,
+                fsdp_inference=fastvideo_args.use_fsdp_inference,
+                # TODO(will): make these configurable
+                default_dtype=default_dtype,
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+                output_dtype=None,
+                training_mode=fastvideo_args.training_mode,
+                enable_torch_compile=fastvideo_args.enable_torch_compile,
+                torch_compile_kwargs=fastvideo_args.torch_compile_kwargs,
+            )
 
         total_params = sum(p.numel() for p in model.parameters())
         logger.info("Loaded model with %.2fB parameters", total_params / 1e9)
@@ -1371,5 +1371,13 @@ class PipelineComponentLoader:
             module_name, transformers_or_diffusers
         )
 
-        # Load the module
-        return loader.load(component_model_path, fastvideo_args)
+        # fastvideo_args.attention_backend is the process-wide default request;
+        # it applies per component (each component resolves its own backend)
+        # and yields to any already-active scope (e.g. a per-role request from
+        # the train stack's moduleloader).
+        requested = getattr(fastvideo_args, "attention_backend", None)
+        attention_context = (attention_backend_scope(requested, component=module_name)
+                             if requested is not None and active_attention_backend_scope() is None else
+                             nullcontext())
+        with attention_context:
+            return loader.load(component_model_path, fastvideo_args)

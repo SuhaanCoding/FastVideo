@@ -123,6 +123,13 @@ class FastVideoArgs:
 
     output_type: str = "pil"
 
+    # Process-wide default attention backend request. Applied per component
+    # at load time (each component resolves its own backend); a component- or
+    # role-level request (e.g. the train stack's per-role attention_backend)
+    # overrides it. None keeps today's behavior (FASTVIDEO_ATTENTION_BACKEND
+    # env var, then per-layer defaults, then platform auto-selection).
+    attention_backend: str | None = None
+
     # CPU offload parameters
     dit_cpu_offload: bool = True
     use_fsdp_inference: bool = False
@@ -257,6 +264,10 @@ class FastVideoArgs:
         self._apply_ltx2_vae_overrides()
         self._resolve_refine_args()
         self._apply_transformer_quant()
+        if self.attention_backend is not None:
+            # Fail fast on typos instead of silently auto-selecting later.
+            from fastvideo.attention.selector import coerce_attn_backend
+            coerce_attn_backend(self.attention_backend)
         self.check_fastvideo_args()
 
     def _apply_transformer_quant(self) -> None:
@@ -437,6 +448,17 @@ class FastVideoArgs:
             default=FastVideoArgs.output_type,
             choices=["pil"],
             help="Output type for the generated video",
+        )
+
+        # Attention backend (process-wide default request)
+        parser.add_argument(
+            "--attention-backend",
+            type=str,
+            default=FastVideoArgs.attention_backend,
+            help="Default attention backend request (e.g. FLASH_ATTN, TORCH_SDPA, "
+            "SAGE_ATTN). Applied per component at load time; component/role-level "
+            "requests override it. Unset: FASTVIDEO_ATTENTION_BACKEND env var, "
+            "then per-layer defaults, then automatic selection.",
         )
 
         # Prompt text file for batch processing

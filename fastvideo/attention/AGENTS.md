@@ -10,7 +10,7 @@ Backend registry + selector wrapping FlashAttn / SageAttn / SageAttn3 / SDPA / V
 attention/
 ├── __init__.py            # Exports DistributedAttention, LocalAttention, get_attn_backend
 ├── layer.py               # DistributedAttention, DistributedAttention_VSA, LocalAttention
-├── selector.py            # get_attn_backend (cached) + env-var override
+├── selector.py            # get_attn_backend (cached) + attention_backend_scope
 ├── backends/
 │   ├── abstract.py        #   AttentionBackend / AttentionMetadata / AttentionMetadataBuilder
 │   ├── flash_attn.py      #   FA2/FA3
@@ -28,15 +28,28 @@ attention/
 
 ## Selection Order
 
-`get_attn_backend()` resolves via:
+`get_attn_backend()` reads every selection input, then resolves via, in
+precedence order:
 
-1. Env-var override `FASTVIDEO_ATTENTION_BACKEND` (see `STR_BACKEND_ENV_VAR` in `fastvideo/utils.py`).
-2. Per-platform default from `fastvideo/platforms/`.
-3. Heuristic fallback to SDPA.
+1. `global_force_attn_backend(...)` — deprecated process-global override.
+2. The active `attention_backend_scope(...)` request (per component).
+3. Env-var `FASTVIDEO_ATTENTION_BACKEND` (see `STR_BACKEND_ENV_VAR` in
+   `fastvideo/utils.py`) — suppressed while a scope is active unless the
+   scope passes `consult_env=True`.
+4. The layer-declared `default_backend`.
+5. Per-platform automatic selection from `fastvideo/platforms/`, which probes
+   the *current device's* capability.
 
-The result is `@lru_cache`d. Tests that need a specific backend must use the
-`global_force_attn_backend(...)` context manager from `selector.py`, never set
-the env var mid-process.
+The result is cached on **all** of those inputs (plus component identity and
+device index), so a changed request simply lands on a different cache key —
+no `cache_clear()` is needed and none should be added.
+
+Callers that need a specific backend for one component (a role model, a
+teacher/critic pair, a test) use `attention_backend_scope(backend,
+component=...)`: it is process-local, exception-safe, and nestable.
+`attention_backend_scope(None)` means "automatic selection, ignore the
+process-wide request". Never mutate `FASTVIDEO_ATTENTION_BACKEND`
+mid-process.
 
 ## Adding a Backend
 

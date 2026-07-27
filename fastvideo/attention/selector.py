@@ -4,6 +4,8 @@
 import os
 from collections.abc import Generator
 from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from functools import cache
 from typing import cast
 
@@ -90,11 +92,9 @@ def global_force_attn_backend(attn_backend: AttentionBackendEnum | None) -> None
     '''
     global forced_attn_backend
     forced_attn_backend = attn_backend
-    # Backend selection is cached by tensor shape/dtype, while the global
-    # override is intentionally not part of that cache key. Invalidate cached
-    # resolutions whenever the override changes so independently constructed
-    # role models can bind different attention implementations.
-    _cached_get_attn_backend.cache_clear()
+    # No cache_clear: every selection input (including this override) is part
+    # of the resolution cache key, so mutations take effect on the next call
+    # by construction. Prefer attention_backend_scope for new code.
 
 
 def get_global_forced_attn_backend() -> AttentionBackendEnum | None:
@@ -105,6 +105,49 @@ def get_global_forced_attn_backend() -> AttentionBackendEnum | None:
     return forced_attn_backend
 
 
+@dataclass(frozen=True)
+class _BackendScope:
+    backend: AttentionBackendEnum | None
+    component: str | None
+    consult_env: bool
+
+
+_SCOPE: ContextVar[_BackendScope | None] = ContextVar("fastvideo_attention_backend_scope", default=None)
+
+
+@contextmanager
+def attention_backend_scope(
+    attn_backend: AttentionBackendEnum | str | None,
+    component: str | None = None,
+    *,
+    consult_env: bool = False,
+) -> Generator[None, None, None]:
+    """Declare the attention-backend request for components constructed
+    inside this scope (per-component resolution: each component resolves
+    its own decision).
+
+    While a scope is set, the environment variable is NOT consulted unless
+    ``consult_env=True`` — so ``attention_backend_scope(None)`` means
+    "automatic selection, ignore any process-wide env request" (e.g. dense
+    teacher/critic roles built alongside a quantized student). Exception-safe;
+    scopes are process-local ContextVars, legal to nest.
+
+    Unlike ``global_force_attn_backend_context_manager`` this mutates no
+    process-global and never needs a cache flush: the scope value is part of
+    the resolution cache key.
+    """
+    token = _SCOPE.set(_BackendScope(coerce_attn_backend(attn_backend), component, consult_env))
+    try:
+        yield
+    finally:
+        _SCOPE.reset(token)
+
+
+def active_attention_backend_scope() -> "_BackendScope | None":
+    """The scope governing components constructed right now, or None."""
+    return _SCOPE.get()
+
+
 def get_attn_backend(
     head_size: int,
     dtype: torch.dtype,
@@ -112,7 +155,37 @@ def get_attn_backend(
     | None = None,
     default_backend: AttentionBackendEnum | None = None,
 ) -> type[AttentionBackend]:
-    return _cached_get_attn_backend(head_size, dtype, supported_attention_backends, default_backend)
+    # Resolve every selection-affecting input BEFORE the cache so all of them
+    # live in the cache key: no mutation (env, global force, scope) ever needs
+    # a cache_clear again, and components with different requests get distinct
+    # cache entries (per-component resolution).
+    scope = _SCOPE.get()
+    if scope is not None:
+        requested = scope.backend
+        component = scope.component
+        env_backend = envs.FASTVIDEO_ATTENTION_BACKEND if scope.consult_env else None
+    else:
+        requested = None
+        component = None
+        env_backend = envs.FASTVIDEO_ATTENTION_BACKEND
+    # The active device is a real selection input, not bookkeeping: the
+    # platform's backend resolution runs capability probes against the
+    # *current* device (e.g. AttnQatInferBackend's per-arch capability sets
+    # decide sm_12x CUTLASS vs sm_100/sm_103 FP4 FA4 vs FlashAttention
+    # fallback). Keying on it means a resolution taken for one device is
+    # never handed to another.
+    device_index = torch.cuda.current_device() if torch.cuda.is_available() else None
+    return _cached_get_attn_backend(
+        head_size,
+        dtype,
+        supported_attention_backends,
+        default_backend,
+        forced=get_global_forced_attn_backend(),
+        requested=requested,
+        env_backend=env_backend,
+        component=component,
+        device_index=device_index,
+    )
 
 
 @cache
@@ -122,26 +195,34 @@ def _cached_get_attn_backend(
     supported_attention_backends: tuple[AttentionBackendEnum, ...]
     | None = None,
     default_backend: AttentionBackendEnum | None = None,
+    *,
+    forced: AttentionBackendEnum | None = None,
+    requested: AttentionBackendEnum | None = None,
+    env_backend: str | None = None,
+    component: str | None = None,
+    device_index: int | None = None,
 ) -> type[AttentionBackend]:
-    # Check whether a particular choice of backend was
-    # previously forced.
-    #
-    # THIS SELECTION OVERRIDES THE FASTVIDEO_ATTENTION_BACKEND
-    # ENVIRONMENT VARIABLE.
+    # Pure resolution: every selection input arrives as an argument (and is
+    # therefore part of the functools cache key). Only get_attn_backend calls
+    # this; it performs the scope/env/force reads.
     if not supported_attention_backends:
         raise ValueError("supported_attention_backends is empty")
-    selected_backend = None
-    backend_by_global_setting: AttentionBackendEnum | None = (get_global_forced_attn_backend())
-    if backend_by_global_setting is not None:
-        selected_backend = backend_by_global_setting
-    else:
-        # Check the environment variable and override if specified
-        backend_by_env_var: str | None = envs.FASTVIDEO_ATTENTION_BACKEND
-        if backend_by_env_var is not None:
-            selected_backend = backend_name_to_enum(backend_by_env_var)
+    # Cache-key-only inputs: component identity separates two components that
+    # agree on shape/dtype but not on request; device_index separates
+    # resolutions taken under different device capabilities (the platform
+    # probes the current device below).
+    del component, device_index
+    # Precedence (behavior-preserving): the deprecated process-global force
+    # first, then the scoped per-component request (which occupies exactly the
+    # position the force held when moduleloader used it for per-role models),
+    # then the env var (already suppressed by the wrapper when a scope is
+    # active), then the layer-declared default.
+    selected_backend = forced if forced is not None else requested
+    if selected_backend is None and env_backend is not None:
+        selected_backend = backend_name_to_enum(env_backend)
 
     # Layer-level default (e.g. a checkpoint that requires a specific sparse
-    # backend). Lower precedence than the global force and the env var, so
+    # backend). Lower precedence than the force/scope/env requests, so
     # users can still override it.
     if selected_backend is None and default_backend is not None:
         selected_backend = default_backend
